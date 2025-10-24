@@ -1,0 +1,519 @@
+using System;
+using System.IO;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+using System.Threading;
+using System.Collections.Concurrent;
+
+class Program
+{
+    static int CONTROL_PORT = 9000;
+    static string STORAGE = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "storage", "users");
+    static UserManager userManager;
+    static CancellationTokenSource cts = new();
+
+    static void Main()
+    {
+        Directory.CreateDirectory(STORAGE);
+        userManager = new UserManager(STORAGE);
+
+        TcpListener listener = new(IPAddress.Any, CONTROL_PORT);
+        listener.Start();
+        Console.WriteLine($"[Server] Listening control port {CONTROL_PORT}");
+
+        while (!cts.IsCancellationRequested)
+        {
+            var client = listener.AcceptTcpClient();
+            Console.WriteLine("[Server] Accepted control connection");
+            ThreadPool.QueueUserWorkItem(HandleControlClient, client);
+        }
+    }
+
+    static void HandleControlClient(object state)
+    {
+        var tcp = (TcpClient)state;
+        using var stream = tcp.GetStream();
+        var rw = new StreamReader(stream, Encoding.UTF8);
+        var wr = new StreamWriter(stream, Encoding.UTF8) { AutoFlush = true };
+
+        Session session = new(userManager, wr);
+
+        try
+        {
+            wr.WriteLine("WELCOME");
+            while (true)
+            {
+                var line = rw.ReadLine();
+                if (line == null) break;
+                Console.WriteLine($"[Ctrl] {line}");
+                var parts = line.Split(' ', 3, StringSplitOptions.RemoveEmptyEntries);
+                if (parts.Length == 0) { wr.WriteLine("ERR BAD_CMD"); continue; }
+
+                var cmd = parts[0].ToUpperInvariant();
+                switch (cmd)
+                {
+                    case "REGISTER":
+                        {
+                            if (parts.Length < 3) { wr.WriteLine("ERR USAGE: REGISTER user pass"); break; }
+                            var user = parts[1]; var pass = parts[2];
+                            if (userManager.Register(user, pass, out var msg)) wr.WriteLine("OK " + msg);
+                            else wr.WriteLine("ERR " + msg);
+                            break;
+                        }
+                    case "LOGIN":
+                        {
+                            if (parts.Length < 3) { wr.WriteLine("ERR USAGE: LOGIN user pass"); break; }
+                            var user = parts[1]; var pass = parts[2];
+                            if (userManager.Authenticate(user, pass, out var msg))
+                            {
+                                session.Login(user);
+                                wr.WriteLine("OK " + msg);
+                            }
+                            else wr.WriteLine("ERR " + msg);
+                            break;
+                        }
+                    case "LIST":
+                        {
+                            if (!session.IsAuthenticated) { wr.WriteLine("ERR LOGIN_REQUIRED"); break; }
+                            var rel = parts.Length >= 2 ? parts[1] : "/";
+                            var list = userManager.List(session.Username, rel, out var err);
+                            if (list == null) wr.WriteLine("ERR " + err);
+                            else
+                            {
+                                wr.WriteLine("OK LIST_BEGIN");
+                                foreach (var s in list) wr.WriteLine(s);
+                                wr.WriteLine("OK LIST_END");
+                            }
+                            break;
+                        }
+                    case "MKDIR":
+                        {
+                            if (!session.IsAuthenticated) { wr.WriteLine("ERR LOGIN_REQUIRED"); break; }
+                            if (parts.Length < 2) { wr.WriteLine("ERR USAGE: MKDIR path"); break; }
+                            var rel = parts[1];
+                            if (userManager.MakeDir(session.Username, rel, out var err)) wr.WriteLine("OK");
+                            else wr.WriteLine("ERR " + err);
+                            break;
+                        }
+                    case "UPLOAD_INIT":
+                        {
+                            if (!session.IsAuthenticated) { wr.WriteLine("ERR LOGIN_REQUIRED"); break; }
+                            var tokens = line.Split(' ', 5);
+                            if (tokens.Length < 5) { wr.WriteLine("ERR USAGE: UPLOAD_INIT path filename size streams"); break; }
+                            var path = tokens[1]; var filename = tokens[2];
+                            if (!long.TryParse(tokens[3], out var size)) { wr.WriteLine("ERR BAD_SIZE"); break; }
+                            if (!int.TryParse(tokens[4], out var streamsCount)) { wr.WriteLine("ERR BAD_STREAMS"); break; }
+                            var dataPort = DataTransferManager.ReservePort();
+                            var job = DataTransferManager.CreateUploadJob(session.Username, path, filename, size, streamsCount, userManager);
+                            DataTransferManager.RegisterJob(job, dataPort);
+                            wr.WriteLine($"OK PORT {dataPort}");
+                            break;
+                        }
+                    case "DOWNLOAD_INIT":
+                        {
+                            if (!session.IsAuthenticated) { wr.WriteLine("ERR LOGIN_REQUIRED"); break; }
+                            var tokens = line.Split(' ', 4);
+                            if (tokens.Length < 4) { wr.WriteLine("ERR USAGE: DOWNLOAD_INIT path filename streams"); break; }
+                            var path = tokens[1]; var filename = tokens[2];
+                            if (!int.TryParse(tokens[3], out var streamsCount)) { wr.WriteLine("ERR BAD_STREAMS"); break; }
+                            var dataPort = DataTransferManager.ReservePort();
+                            var job = DataTransferManager.CreateDownloadJob(session.Username, path, filename, streamsCount, userManager);
+                            if (job == null) { wr.WriteLine("ERR FILE_NOT_FOUND"); break; }
+                            DataTransferManager.RegisterJob(job, dataPort);
+                            wr.WriteLine($"OK PORT {dataPort}");
+                            break;
+                        }
+                    case "RENAME_FILE":
+                        {
+                            if (!session.IsAuthenticated) { wr.WriteLine("ERR LOGIN_REQUIRED"); break; }
+                            if (parts.Length < 3) { wr.WriteLine("ERR USAGE: RENAME_FILE path old_new (use: path oldName newName)"); break; }
+                            var args = line.Substring("RENAME_FILE ".Length).Split(' ', 3);
+                            if (args.Length < 3) { wr.WriteLine("ERR USAGE: RENAME_FILE path old new"); break; }
+                            var path = args[0]; var oldName = args[1]; var newName = args[2];
+                            if (userManager.RenameFile(session.Username, path, oldName, newName, out var err)) wr.WriteLine("OK");
+                            else wr.WriteLine("ERR " + err);
+                            break;
+                        }
+                    case "RENAME_DIR":
+                        {
+                            if (!session.IsAuthenticated) { wr.WriteLine("ERR LOGIN_REQUIRED"); break; }
+                            var args = line.Substring("RENAME_DIR ".Length).Split(' ', 3);
+                            if (args.Length < 3) { wr.WriteLine("ERR USAGE: RENAME_DIR parentPath oldName newName"); break; }
+                            var parent = args[0]; var oldName = args[1]; var newName = args[2];
+                            if (userManager.RenameDir(session.Username, parent, oldName, newName, out var err)) wr.WriteLine("OK");
+                            else wr.WriteLine("ERR " + err);
+                            break;
+                        }
+                    case "DELETE_FILE":
+                        {
+                            if (!session.IsAuthenticated) { wr.WriteLine("ERR LOGIN_REQUIRED"); break; }
+                            var tokens2 = line.Split(' ', 3);
+                            if (tokens2.Length < 3) { wr.WriteLine("ERR USAGE: DELETE_FILE path filename"); break; }
+                            if (userManager.DeleteFile(session.Username, tokens2[1], tokens2[2], out var err)) wr.WriteLine("OK"); else wr.WriteLine("ERR " + err);
+                            break;
+                        }
+                    case "DELETE_DIR":
+                        {
+                            if (!session.IsAuthenticated) { wr.WriteLine("ERR LOGIN_REQUIRED"); break; }
+                            var tokens2 = line.Split(' ', 2);
+                            if (tokens2.Length < 2) { wr.WriteLine("ERR USAGE: DELETE_DIR path"); break; }
+                            if (userManager.DeleteDir(session.Username, tokens2[1], out var err)) wr.WriteLine("OK"); else wr.WriteLine("ERR " + err);
+                            break;
+                        }
+                    case "COPY_FILE":
+                        {
+                            if (!session.IsAuthenticated) { wr.WriteLine("ERR LOGIN_REQUIRED"); break; }
+                            var tokens2 = line.Split(' ', 3);
+                            if (tokens2.Length < 3) { wr.WriteLine("ERR USAGE: COPY_FILE path filename"); break; }
+                            if (userManager.CopyFile(session.Username, tokens2[1], tokens2[2], out var err)) wr.WriteLine("OK"); else wr.WriteLine("ERR " + err);
+                            break;
+                        }
+                    case "LOGOUT":
+                        {
+                            session.Logout();
+                            wr.WriteLine("OK");
+                            break;
+                        }
+                    case "QUIT":
+                        {
+                            wr.WriteLine("BYE");
+                            tcp.Close();
+                            return;
+                        }
+                    default:
+                        wr.WriteLine("ERR UNKNOWN_CMD");
+                        break;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine("[Ctrl] Exception: " + ex);
+        }
+        finally
+        {
+            tcp.Close();
+        }
+    }
+}
+
+class Session
+{
+    public string Username { get; private set; }
+    public bool IsAuthenticated => !string.IsNullOrEmpty(Username);
+    UserManager um;
+    StreamWriter writer;
+    public Session(UserManager um, StreamWriter writer) { this.um = um; this.writer = writer; }
+    public void Login(string username) => Username = username;
+    public void Logout() => Username = null;
+}
+
+class UserManager
+{
+    readonly string basePath;
+    readonly ConcurrentDictionary<string, string> users = new();
+    readonly ConcurrentDictionary<string, ReaderWriterLockSlim> locks = new();
+
+    public UserManager(string basePath)
+    {
+        this.basePath = basePath;
+        Directory.CreateDirectory(basePath);
+    }
+
+    public bool Register(string username, string password, out string msg)
+    {
+        if (string.IsNullOrWhiteSpace(username) || string.IsNullOrWhiteSpace(password)) { msg = "BAD_INPUT"; return false; }
+        if (users.ContainsKey(username)) { msg = "USER_EXISTS"; return false; }
+        users[username] = password;
+        var up = Path.Combine(basePath, username);
+        Directory.CreateDirectory(up);
+        locks[username] = new ReaderWriterLockSlim();
+        msg = "REGISTERED";
+        Console.WriteLine($"[UM] Registered {username}");
+        return true;
+    }
+
+    public bool Authenticate(string username, string password, out string msg)
+    {
+        if (!users.TryGetValue(username, out var p)) { msg = "NO_USER"; return false; }
+        if (p != password) { msg = "BAD_PASS"; return false; }
+        msg = "AUTH_OK";
+        return true;
+    }
+
+    string Resolve(string username, string rel)
+    {
+        rel = rel.Replace('\\','/').Trim();
+        if (string.IsNullOrEmpty(rel) || rel == "/") rel = "";
+        if (rel.Contains("..")) throw new InvalidOperationException("INVALID_PATH");
+        var userRoot = Path.Combine(basePath, username);
+        var full = Path.Combine(userRoot, rel);
+        return full;
+    }
+
+    public string[] List(string username, string rel, out string err)
+    {
+        err = null;
+        try
+        {
+            var full = Resolve(username, rel);
+            if (!Directory.Exists(full)) { err = "NO_SUCH_DIR"; return null; }
+            var dirInfo = new DirectoryInfo(full);
+            var entries = new System.Collections.Generic.List<string>();
+            foreach (var d in dirInfo.GetDirectories()) entries.Add($"DIR\t{d.Name}");
+            foreach (var f in dirInfo.GetFiles()) entries.Add($"FILE\t{f.Name}\t{f.Length}");
+            return entries.ToArray();
+        }
+        catch (Exception ex) { err = ex.Message; return null; }
+    }
+
+    public bool MakeDir(string username, string rel, out string err)
+    {
+        err = null;
+        try
+        {
+            var full = Resolve(username, rel);
+            if (Directory.Exists(full)) { err = "ALREADY_EXISTS"; return false; }
+            Directory.CreateDirectory(full);
+            return true;
+        }
+        catch (Exception ex) { err = ex.Message; return false; }
+    }
+
+    public bool RenameFile(string username, string rel, string oldName, string newName, out string err)
+    {
+        err = null;
+        try
+        {
+            var dir = Resolve(username, rel);
+            var oldp = Path.Combine(dir, oldName);
+            var newp = Path.Combine(dir, newName);
+            if (!File.Exists(oldp)) { err = "NO_FILE"; return false; }
+            if (File.Exists(newp)) { err = "DEST_EXISTS"; return false; }
+            File.Move(oldp, newp);
+            return true;
+        }
+        catch (Exception ex) { err = ex.Message; return false; }
+    }
+
+    public bool RenameDir(string username, string parentRel, string oldName, string newName, out string err)
+    {
+        err = null;
+        try
+        {
+            var parent = Resolve(username, parentRel);
+            var oldp = Path.Combine(parent, oldName);
+            var newp = Path.Combine(parent, newName);
+            if (!Directory.Exists(oldp)) { err = "NO_DIR"; return false; }
+            if (Directory.Exists(newp)) { err = "DEST_EXISTS"; return false; }
+            Directory.Move(oldp, newp);
+            return true;
+        }
+        catch (Exception ex) { err = ex.Message; return false; }
+    }
+
+    public bool DeleteFile(string username, string rel, string filename, out string err)
+    {
+        err = null;
+        try
+        {
+            var p = Path.Combine(Resolve(username, rel), filename);
+            if (!File.Exists(p)) { err = "NO_FILE"; return false; }
+            File.Delete(p);
+            return true;
+        }
+        catch (Exception ex) { err = ex.Message; return false; }
+    }
+
+    public bool DeleteDir(string username, string rel, out string err)
+    {
+        err = null;
+        try
+        {
+            var p = Resolve(username, rel);
+            var userRoot = Path.Combine(basePath, username).TrimEnd(Path.DirectorySeparatorChar);
+            if (Path.GetFullPath(p).TrimEnd(Path.DirectorySeparatorChar).Equals(userRoot, StringComparison.OrdinalIgnoreCase))
+            {
+                err = "FORBIDDEN_ROOT";
+                return false;
+            }
+            if (!Directory.Exists(p)) { err = "NO_DIR"; return false; }
+            Directory.Delete(p, true);
+            return true;
+        }
+        catch (Exception ex) { err = ex.Message; return false; }
+    }
+
+    public bool CopyFile(string username, string rel, string filename, out string err)
+    {
+        err = null;
+        try
+        {
+            var dir = Resolve(username, rel);
+            var src = Path.Combine(dir, filename);
+            if (!File.Exists(src)) { err = "NO_FILE"; return false; }
+            var i = 1;
+            string dest;
+            do
+            {
+                dest = Path.Combine(dir, $"{Path.GetFileNameWithoutExtension(filename)}_{i}{Path.GetExtension(filename)}");
+                i++;
+            } while (File.Exists(dest));
+            File.Copy(src, dest);
+            return true;
+        }
+        catch (Exception ex) { err = ex.Message; return false; }
+    }
+
+    public string GetFullPathForWrite(string username, string rel, string filename)
+    {
+        var d = Resolve(username, rel);
+        Directory.CreateDirectory(d);
+        return Path.Combine(d, filename);
+    }
+
+    public string GetFullPathForRead(string username, string rel, string filename)
+    {
+        var p = Path.Combine(Resolve(username, rel), filename);
+        return p;
+    }
+}
+
+class DataTransferManager
+{
+    static int basePort = 10000;
+    static object portLock = new();
+    static ConcurrentDictionary<int, TransferJob> jobs = new();
+
+    public static int ReservePort()
+    {
+        lock (portLock)
+        {
+            return Interlocked.Increment(ref basePort);
+        }
+    }
+
+    public static void RegisterJob(TransferJob job, int port)
+    {
+        var listener = new TcpListener(IPAddress.Any, port);
+        listener.Start();
+        job.Listener = listener;
+        jobs[port] = job;
+        Console.WriteLine($"[DTM] Registered job {job.Id} on port {port}. Expecting {job.Streams} streams.");
+        ThreadPool.QueueUserWorkItem(WaitForStreams, job);
+    }
+
+    static void WaitForStreams(object st)
+    {
+        var job = (TransferJob)st;
+        try
+        {
+            var arrived = 0;
+            while (arrived < job.Streams)
+            {
+                var tcp = job.Listener.AcceptTcpClient();
+                Console.WriteLine($"[DTM] Data connection accepted for job {job.Id}");
+                arrived++;
+                ThreadPool.QueueUserWorkItem(HandleDataStream, (job, tcp, arrived - 1));
+            }
+        }
+        catch (Exception ex) { Console.WriteLine("[DTM] Exception: " + ex.Message); }
+        finally { try { job.Listener.Stop(); } catch { } }
+    }
+
+    static void HandleDataStream(object state)
+    {
+        var (job, tcp, index) = ((TransferJob, TcpClient, int))state;
+        try
+        {
+            using var ns = tcp.GetStream();
+            var br = new BinaryReader(ns);
+            var bw = new BinaryWriter(ns);
+            if (job.IsUpload)
+            {
+                long offset = br.ReadInt64();
+                long length = br.ReadInt64();
+                var fullPath = job.FullPath;
+                using var fs = new FileStream(fullPath, FileMode.OpenOrCreate, FileAccess.Write, FileShare.Write);
+                fs.Seek(offset, SeekOrigin.Begin);
+                var remaining = length;
+                var buffer = new byte[64 * 1024];
+                while (remaining > 0)
+                {
+                    var toRead = (int)Math.Min(buffer.Length, remaining);
+                    var read = ns.Read(buffer, 0, toRead);
+                    if (read <= 0) break;
+                    fs.Write(buffer, 0, read);
+                    remaining -= read;
+                }
+            }
+            else
+            {
+                using var fs = new FileStream(job.FullPath, FileMode.Open, FileAccess.Read, FileShare.Read);
+                var part = job.AssignPart(index);
+                long offset = part.offset;
+                long length = part.length;
+                bw.Write(offset);
+                bw.Write(length);
+                bw.Flush();
+                fs.Seek(offset, SeekOrigin.Begin);
+                var remaining = length;
+                var buffer = new byte[64 * 1024];
+                while (remaining > 0)
+                {
+                    var toRead = (int)Math.Min(buffer.Length, remaining);
+                    var read = fs.Read(buffer, 0, toRead);
+                    if (read <= 0) break;
+                    ns.Write(buffer, 0, read);
+                    remaining -= read;
+                }
+                ns.Flush();
+            }
+        }
+        catch (Exception ex) { Console.WriteLine("[DTM] DataStream exception: " + ex.Message); }
+        finally { tcp.Close(); }
+    }
+
+    public static TransferJob CreateUploadJob(string username, string rel, string filename, long size, int streams, UserManager um)
+    {
+        var path = um.GetFullPathForWrite(username, rel, filename);
+        using (var fs = new FileStream(path, FileMode.OpenOrCreate, FileAccess.Write, FileShare.Write)) fs.SetLength(size);
+        return new TransferJob { Id = Guid.NewGuid().ToString(), IsUpload = true, FullPath = path, Streams = streams };
+    }
+
+    public static TransferJob CreateDownloadJob(string username, string rel, string filename, int streams, UserManager um)
+    {
+        var path = um.GetFullPathForRead(username, rel, filename);
+        if (!File.Exists(path)) return null;
+        var fi = new FileInfo(path);
+        var job = new TransferJob { Id = Guid.NewGuid().ToString(), IsUpload = false, FullPath = path, Streams = streams, FileSize = fi.Length };
+        job.PrepareParts();
+        return job;
+    }
+}
+
+class TransferJob
+{
+    public string Id;
+    public bool IsUpload;
+    public string FullPath;
+    public int Streams;
+    public long FileSize;
+    public TcpListener Listener;
+    public (long offset, long length)[] parts;
+    public void PrepareParts()
+    {
+        parts = new (long offset, long length)[Streams];
+        long baseSize = FileSize / Streams;
+        long rem = FileSize % Streams;
+        long cur = 0;
+        for (int i = 0; i < Streams; i++)
+        {
+            var len = baseSize + (i < rem ? 1 : 0);
+            parts[i] = (cur, len);
+            cur += len;
+        }
+    }
+    public (long offset, long length) AssignPart(int idx) => parts[idx];
+}
