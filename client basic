@@ -1,0 +1,20 @@
+#include "Client.h"
+#include <iostream>
+
+int main() {
+    Client client;
+    client.connectToServer();
+
+    client.registerUser("elnur", "12345");
+    client.login("elnur", "12345");
+
+    auto files = client.listFiles("/");
+    std::cout << "Files in root directory:\n";
+    for (auto &f : files) std::cout << f << std::endl;
+
+    client.uploadFile("local.txt", "/remote.txt", 4);
+    client.downloadFile("/remote.txt", "local_copy.txt", 4);
+
+    client.disconnect();
+    return 0;
+}
