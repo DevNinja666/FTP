@@ -1,0 +1,77 @@
+using Microsoft.Win32;
+using System;
+using System.Linq;
+using System.Threading.Tasks;
+using System.Windows;
+
+public partial class MainWindow : Window
+{
+    FtpClient ftp = new();
+
+    public MainWindow() { InitializeComponent(); }
+
+    private async void BtnConnect_Click(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            await ftp.ConnectAsync(txtHost.Text, int.Parse(txtPort.Text));
+            MessageBox.Show("Connected");
+        }
+        catch (Exception ex) { MessageBox.Show(ex.Message); }
+    }
+
+    private async void BtnRegister_Click(object sender, RoutedEventArgs e)
+    {
+        var ok = await ftp.Register(txtUser.Text, txtPass.Password);
+        MessageBox.Show(ok ? "Registered" : "Failed");
+    }
+
+    private async void BtnLogin_Click(object sender, RoutedEventArgs e)
+    {
+        var ok = await ftp.Login(txtUser.Text, txtPass.Password);
+        MessageBox.Show(ok ? "Logged in" : "Failed");
+    }
+
+    private async void BtnRefresh_Click(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            var list = await ftp.List("/");
+            lstFiles.Items.Clear();
+            foreach (var l in list) lstFiles.Items.Add(l);
+        }
+        catch (Exception ex) { MessageBox.Show(ex.Message); }
+    }
+
+    private async void BtnUpload_Click(object sender, RoutedEventArgs e)
+    {
+        var dlg = new OpenFileDialog();
+        if (dlg.ShowDialog() != true) return;
+        var streams = int.Parse(txtStreams.Text);
+        try
+        {
+            await ftp.UploadFileMulti(txtHost.Text, int.Parse(txtPort.Text) + 10000, dlg.FileName, "/", System.IO.Path.GetFileName(dlg.FileName), streams);
+            MessageBox.Show("Uploaded");
+        }
+        catch (Exception ex) { MessageBox.Show(ex.Message); }
+    }
+
+    private async void BtnDownload_Click(object sender, RoutedEventArgs e)
+    {
+        if (lstFiles.SelectedItem == null) return;
+        var sel = lstFiles.SelectedItem.ToString().Split('\t');
+        if (sel[0] != "FILE") { MessageBox.Show("Select file"); return; }
+        var filename = sel[1];
+        var streams = int.Parse(txtStreams.Text);
+        try
+        {
+            // ask server for download init
+            var port = await ftp.InitDownload("/", filename, streams);
+            var save = new SaveFileDialog { FileName = filename };
+            if (save.ShowDialog() != true) return;
+            await ftp.DownloadFileMulti(txtHost.Text, port, save.FileName, streams);
+            MessageBox.Show("Downloaded");
+        }
+        catch (Exception ex) { MessageBox.Show(ex.Message); }
+    }
+}
