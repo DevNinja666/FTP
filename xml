@@ -1,0 +1,38 @@
+<Window x:Class="FtpLikeClientWpf.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        Title="FTP-like Client" Height="500" Width="800">
+    <Grid Margin="10">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+        </Grid.RowDefinitions>
+
+        <StackPanel Orientation="Horizontal" Grid.Row="0" Margin="0,0,0,8">
+            <TextBox x:Name="txtHost" Width="120" Text="127.0.0.1"/>
+            <TextBox x:Name="txtPort" Width="60" Text="9000" Margin="6,0,0,0"/>
+            <TextBox x:Name="txtUser" Width="120" Margin="6,0,0,0" PlaceholderText="user"/>
+            <PasswordBox x:Name="txtPass" Width="120" Margin="6,0,0,0"/>
+            <Button x:Name="btnConnect" Content="Connect" Click="BtnConnect_Click" Margin="6,0,0,0"/>
+            <Button Content="Register" Click="BtnRegister_Click" Margin="6,0,0,0"/>
+            <Button Content="Login" Click="BtnLogin_Click" Margin="6,0,0,0"/>
+        </StackPanel>
+
+        <Grid Grid.Row="1">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="2*"/>
+                <ColumnDefinition Width="1*"/>
+            </Grid.ColumnDefinitions>
+
+            <ListBox x:Name="lstFiles" Grid.Column="0"/>
+            <StackPanel Grid.Column="1" Margin="8,0,0,0">
+                <Button Content="Refresh" Click="BtnRefresh_Click" Margin="0,0,0,6"/>
+                <Button Content="Upload" Click="BtnUpload_Click" Margin="0,0,0,6"/>
+                <Button Content="Download" Click="BtnDownload_Click" Margin="0,0,0,6"/>
+                <StackPanel Orientation="Horizontal">
+                    <TextBlock Text="Streams:" VerticalAlignment="Center"/>
+                    <TextBox x:Name="txtStreams" Text="4" Width="40" Margin="6,0,0,0"/>
+                </StackPanel>
+            </StackPanel>
+        </Grid>
+    </Grid>
+</Window>
